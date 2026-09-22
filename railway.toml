@@ -1,0 +1,7 @@
+[build]
+builder = "nixpacks"
+root = "backend"
+
+[deploy]
+startCommand = "gunicorn app:app"
+restartPolicyMaxRetries = 5
