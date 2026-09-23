@@ -1,7 +1,7 @@
 [build]
-builder = "nixpacks"
-root = "backend"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "gunicorn app:app"
+startCommand = "gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 900 app:app"
 restartPolicyMaxRetries = 5

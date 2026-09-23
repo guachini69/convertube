@@ -1,7 +1,7 @@
 Flask==3.0.0
 Flask-CORS==4.0.0
 python-dotenv==1.0.0
-yt-dlp==2024.12.23
+yt-dlp[default,deno]>=2026.06.09,<2027.0
 boto3==1.28.85
-requests==2.31.0
+requests>=2.32.2,<3
 gunicorn==21.2.0

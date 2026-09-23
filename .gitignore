@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 node_modules/
 dist/
 build/
@@ -20,7 +19,6 @@ logs/
 # beside it.
 /.plugins/
 /.opencode-skills/
-=======
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -239,4 +237,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
->>>>>>> 470bcd785f8ed44b69c7087f6afaaca14fc0ca2b
+
+# Finder metadata
+.DS_Store
+
+# A nested checkout of a different project in this workspace
+/Plataforma de convers* de videos/

@@ -1,249 +1,250 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import yt_dlp
-import os
-import boto3
-from dotenv import load_dotenv
-from urllib.parse import urljoin
+"""Convertube API. YouTube extraction is best-effort and may be rate limited upstream."""
+from __future__ import annotations
+
 import logging
-from datetime import datetime, timedelta
+import os
+import re
+import shutil
+import tempfile
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+import boto3
+import yt_dlp
+from botocore.config import Config
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request, send_file
+from flask_cors import CORS
 
 load_dotenv()
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("convertube")
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:5173", "http://localhost:3000", os.getenv("FRONTEND_URL", "*")])
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"]
+allowed_origins.extend(x.strip() for x in os.getenv("FRONTEND_URL", "").split(",") if x.strip())
+CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Cloudflare R2 Configuration
-r2_client = boto3.client(
-    "s3",
-    endpoint_url=os.getenv("CLOUDFLARE_R2_ENDPOINT"),
-    aws_access_key_id=os.getenv("CLOUDFLARE_R2_ACCESS_KEY"),
-    aws_secret_access_key=os.getenv("CLOUDFLARE_R2_SECRET_KEY"),
-    region_name="auto",
-)
-
-BUCKET_NAME = os.getenv("CLOUDFLARE_R2_BUCKET", "convertube-videos")
-TEMP_DIR = "/tmp/videos"
-
-if not os.path.exists(TEMP_DIR):
-    os.makedirs(TEMP_DIR)
+TEMP_DIR = Path(os.getenv("TEMP_DIR", tempfile.gettempdir())) / "convertube-videos"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+BUCKET_NAME = os.getenv("CLOUDFLARE_R2_BUCKET", "")
+VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+QUALITY_HEIGHTS = {"2K": 1440, "1080": 1080, "720": 720, "480": 480}
 
 
-def is_valid_youtube_url(url: str) -> bool:
-    """Validate YouTube URL"""
-    patterns = [
-        r"(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)",
-    ]
-    return any(__import__("re").search(pattern, url) for pattern in patterns)
-
-
-def extract_video_id(url: str) -> str:
-    """Extract video ID from YouTube URL"""
-    import re
-    match = re.search(r"(?:v=|youtu\.be\/|shorts\/)([\w-]{11})", url)
-    return match.group(1) if match else None
-
-
-@app.route("/api/health", methods=["GET"])
-def health():
-    """Health check endpoint"""
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
-
-
-@app.route("/api/validate", methods=["POST"])
-def validate():
-    """Validate YouTube URL and get video info"""
+def extract_video_id(value: str) -> str | None:
+    """Accept standard watch, short, embed, and youtu.be URLs only."""
     try:
-        data = request.json
-        url = data.get("url", "").strip()
-
-        if not url:
-            return jsonify({"error": "URL requerida"}), 400
-
-        if not is_valid_youtube_url(url):
-            return jsonify({"error": "URL de YouTube inválida"}), 400
-
-        video_id = extract_video_id(url)
-        if not video_id:
-            return jsonify({"error": "No se pudo extraer el ID del video"}), 400
-
-        # Get video info with yt-dlp
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": True,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        return jsonify(
-            {
-                "valid": True,
-                "title": info.get("title", "Video"),
-                "duration": info.get("duration", 0),
-                "channel": info.get("channel", "YouTube"),
-                "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
-                "views": info.get("view_count", 0),
-                "video_id": video_id,
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Validation error: {str(e)}")
-        return jsonify({"error": "Error al validar el video"}), 500
+        parsed = urlparse(value.strip())
+    except (AttributeError, ValueError):
+        return None
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    video_id = None
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/")[0]
+    elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
+        if parsed.path == "/watch":
+            from urllib.parse import parse_qs
+            video_id = parse_qs(parsed.query).get("v", [None])[0]
+        else:
+            match = re.match(r"/(?:shorts|embed|live)/([^/?]+)", parsed.path)
+            video_id = match.group(1) if match else None
+    return video_id if video_id and VIDEO_ID_RE.fullmatch(video_id) else None
 
 
-@app.route("/api/download", methods=["POST"])
-def download():
-    """Download video and upload to R2"""
-    try:
-        data = request.json
-        url = data.get("url", "").strip()
-        quality = data.get("quality", "1080")
-
-        if not url or not is_valid_youtube_url(url):
-            return jsonify({"error": "URL inválida"}), 400
-
-        video_id = extract_video_id(url)
-        file_id = str(uuid.uuid4())[:8]
-        output_path = os.path.join(TEMP_DIR, f"{file_id}_%(title)s.%(ext)s")
-
-        # Quality mapping
-        quality_format = {
-            "2K": "bestvideo[height<=1440]+bestaudio/best",
-            "1080": "bestvideo[height<=1080]+bestaudio/best",
-            "720": "bestvideo[height<=720]+bestaudio/best",
-            "480": "bestvideo[height<=480]+bestaudio/best",
-        }
-
-        ydl_opts = {
-            "format": quality_format.get(quality, quality_format["1080"]),
-            "outtmpl": output_path,
-            "quiet": False,
-            "no_warnings": True,
-            "postprocessors": [
-                {
-                    "key": "FFmpegVideoConvertor",
-                    "prefixes": [],
-                    "prettyname": "Convert video to mp4",
-                    "args": ["-c:v", "libx264", "-c:a", "aac", "-strict", "-2"],
-                }
-            ],
-        }
-
-        logger.info(f"Descargando video {video_id} en calidad {quality}")
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-
-        if not os.path.exists(filename):
-            # Find mp4 file
-            mp4_files = [
-                f for f in os.listdir(TEMP_DIR) if f.startswith(file_id) and f.endswith(".mp4")
-            ]
-            if mp4_files:
-                filename = os.path.join(TEMP_DIR, mp4_files[0])
-            else:
-                return jsonify({"error": "No se pudo encontrar el archivo descargado"}), 500
-
-        # Upload to R2
-        r2_key = f"downloads/{file_id}/{os.path.basename(filename)}"
-
-        with open(filename, "rb") as f:
-            r2_client.upload_fileobj(f, BUCKET_NAME, r2_key)
-
-        logger.info(f"Archivo subido a R2: {r2_key}")
-
-        # Clean up temp file
-        os.remove(filename)
-
-        # Generate download URL (expires in 24 hours)
-        download_url = r2_client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": BUCKET_NAME, "Key": r2_key},
-            ExpiresIn=86400,
-        )
-
-        return jsonify(
-            {
-                "success": True,
-                "download_url": download_url,
-                "filename": os.path.basename(filename),
-                "file_id": file_id,
-                "expires_in": 86400,
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Download error: {str(e)}")
-        return jsonify({"error": f"Error en la descarga: {str(e)}"}), 500
+def youtube_options(**overrides):
+    """Share supported JS challenge setup across metadata and download calls."""
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "js_runtimes": {"deno": {}},
+        "socket_timeout": int(os.getenv("YTDLP_SOCKET_TIMEOUT", "20")),
+        "retries": int(os.getenv("YTDLP_RETRIES", "2")),
+    }
+    options.update(overrides)
+    return options
 
 
-@app.route("/api/formats", methods=["GET"])
-def get_formats():
-    """Get available formats for a video"""
-    try:
-        url = request.args.get("url", "").strip()
-
-        if not is_valid_youtube_url(url):
-            return jsonify({"error": "URL inválida"}), 400
-
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": False,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            formats = info.get("formats", [])
-
-        # Extract unique resolutions
-        resolutions = set()
-        for fmt in formats:
-            if fmt.get("height"):
-                resolutions.add(fmt.get("height"))
-
-        return jsonify(
-            {
-                "available_formats": sorted(list(resolutions), reverse=True),
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Formats error: {str(e)}")
-        return jsonify({"error": "Error al obtener formatos"}), 500
+def get_video_info(url: str):
+    with yt_dlp.YoutubeDL(youtube_options()) as ydl:
+        return ydl.extract_info(url, download=False)
 
 
-@app.route("/api/monetag-config", methods=["GET"])
-def monetag_config():
-    """Get Monetag configuration for frontend"""
-    return jsonify(
-        {
-            "publisher_id": os.getenv("MONETAG_PUBLISHER_ID", ""),
-            "enabled": bool(os.getenv("MONETAG_PUBLISHER_ID")),
-        }
+def get_r2_client():
+    required = {
+        "CLOUDFLARE_R2_ENDPOINT": os.getenv("CLOUDFLARE_R2_ENDPOINT"),
+        "CLOUDFLARE_R2_ACCESS_KEY": os.getenv("CLOUDFLARE_R2_ACCESS_KEY"),
+        "CLOUDFLARE_R2_SECRET_KEY": os.getenv("CLOUDFLARE_R2_SECRET_KEY"),
+        "CLOUDFLARE_R2_BUCKET": BUCKET_NAME,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise RuntimeError("Falta configurar Cloudflare R2: " + ", ".join(missing))
+    endpoint = required["CLOUDFLARE_R2_ENDPOINT"]
+    if not endpoint.startswith("https://"):
+        raise RuntimeError("CLOUDFLARE_R2_ENDPOINT debe usar HTTPS")
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=required["CLOUDFLARE_R2_ACCESS_KEY"],
+        aws_secret_access_key=required["CLOUDFLARE_R2_SECRET_KEY"],
+        region_name="auto",
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
 
 
+@app.get("/api/health")
+def health():
+    return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
+
+
+@app.post("/api/validate")
+def validate():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    url = data.get("url", "")
+    if not isinstance(url, str) or not url.strip():
+        return jsonify({"error": "URL requerida"}), 400
+    video_id = extract_video_id(url)
+    if not video_id:
+        return jsonify({"error": "URL de YouTube inválida"}), 400
+    try:
+        info = get_video_info(url.strip())
+        return jsonify({
+            "valid": True,
+            "title": info.get("title") or "Video",
+            "duration": info.get("duration") or 0,
+            "channel": info.get("channel") or info.get("uploader") or "YouTube",
+            "thumbnail": info.get("thumbnail") or f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+            "views": info.get("view_count") or 0,
+            "video_id": video_id,
+        })
+    except Exception as exc:
+        logger.exception("YouTube validation failed for %s", video_id)
+        # This exact upstream response is caused by YouTube's rotating JS challenges;
+        # yt-dlp[default] + a supported Deno runtime provides the EJS solver.
+        detail = str(exc)
+        if "page needs to be reloaded" in detail.lower():
+            detail = "YouTube rechazó temporalmente la solicitud. Actualiza yt-dlp y el soporte EJS, y vuelve a intentar."
+        return jsonify({"error": "Error al validar el video", "detail": detail}), 502
+
+
+@app.post("/api/download")
+def download():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    url = data.get("url", "")
+    quality = str(data.get("quality", "1080"))
+    if not isinstance(url, str) or not extract_video_id(url):
+        return jsonify({"error": "URL de YouTube inválida"}), 400
+    if quality not in QUALITY_HEIGHTS:
+        return jsonify({"error": "Calidad no válida"}), 400
+    ffmpeg_path = shutil.which(os.getenv("FFMPEG_BINARY", "ffmpeg"))
+    if not ffmpeg_path:
+        return jsonify({"error": "FFmpeg no está instalado en el servidor"}), 503
+
+    file_id = uuid.uuid4().hex[:12]
+    output_template = str(TEMP_DIR / f"{file_id}.%(ext)s")
+    height = QUALITY_HEIGHTS[quality]
+    keep_local_file = False
+    format_selector = (
+        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"best[height<={height}][ext=mp4]"
+    )
+    try:
+        r2_configured = all(os.getenv(name) for name in (
+            "CLOUDFLARE_R2_ENDPOINT", "CLOUDFLARE_R2_ACCESS_KEY",
+            "CLOUDFLARE_R2_SECRET_KEY", "CLOUDFLARE_R2_BUCKET",
+        ))
+        local_mode = os.getenv("ENVIRONMENT", "development").lower() != "production" and not r2_configured
+        r2 = None if local_mode else get_r2_client()
+        with yt_dlp.YoutubeDL(youtube_options(
+            format=format_selector,
+            outtmpl=output_template,
+            merge_output_format="mp4",
+            ffmpeg_location=ffmpeg_path,
+            # Prefer remuxing compatible streams and avoid expensive, lossy full re-encoding.
+            postprocessors=[{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
+        )) as ydl:
+            info = ydl.extract_info(url.strip(), download=True)
+            filepath = Path(ydl.prepare_filename(info))
+        candidates = [p for p in TEMP_DIR.glob(f"{file_id}.*") if p.is_file() and not p.name.endswith((".part", ".ytdl"))]
+        if filepath.exists():
+            final_path = filepath
+        elif candidates:
+            final_path = next((p for p in candidates if p.suffix.lower() == ".mp4"), candidates[0])
+        else:
+            raise RuntimeError("yt-dlp terminó sin generar un archivo descargable")
+
+        if r2:
+            object_key = f"downloads/{file_id}/{final_path.name}"
+            r2.upload_file(str(final_path), BUCKET_NAME, object_key, ExtraArgs={"ContentType": "video/mp4"})
+            download_url = r2.generate_presigned_url(
+                "get_object", Params={"Bucket": BUCKET_NAME, "Key": object_key}, ExpiresIn=86400,
+            )
+            expires_in = 86400
+        else:
+            keep_local_file = True
+            download_url = f"{request.host_url.rstrip('/')}/api/files/{file_id}"
+            expires_in = None
+        return jsonify({"success": True, "download_url": download_url, "filename": final_path.name,
+                        "file_id": file_id, "expires_in": expires_in})
+    except Exception as exc:
+        logger.exception("Download failed for %s", file_id)
+        return jsonify({"error": "Error en la descarga", "detail": str(exc)}), 502
+    finally:
+        if not keep_local_file:
+            for path in TEMP_DIR.glob(f"{file_id}.*"):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove temporary file %s", path)
+
+
+@app.get("/api/files/<file_id>")
+def download_local_file(file_id):
+    """Serve development downloads kept on local disk when R2 is not configured."""
+    if not re.fullmatch(r"[a-f0-9]{12}", file_id):
+        return jsonify({"error": "Archivo no encontrado"}), 404
+    matches = [p for p in TEMP_DIR.glob(f"{file_id}.*") if p.is_file() and not p.name.endswith((".part", ".ytdl"))]
+    if not matches:
+        return jsonify({"error": "Archivo no encontrado"}), 404
+    return send_file(matches[0], as_attachment=True, download_name=matches[0].name)
+
+
+@app.get("/api/formats")
+def get_formats():
+    url = request.args.get("url", "")
+    if not extract_video_id(url):
+        return jsonify({"error": "URL de YouTube inválida"}), 400
+    try:
+        info = get_video_info(url.strip())
+        heights = sorted({int(fmt["height"]) for fmt in info.get("formats", []) if fmt.get("height")}, reverse=True)
+        return jsonify({"available_formats": heights})
+    except Exception as exc:
+        logger.exception("Format lookup failed")
+        return jsonify({"error": "Error al obtener formatos", "detail": str(exc)}), 502
+
+
+@app.get("/api/monetag-config")
+def monetag_config():
+    publisher_id = os.getenv("MONETAG_PUBLISHER_ID", "")
+    return jsonify({"publisher_id": publisher_id, "enabled": bool(publisher_id)})
+
+
 @app.errorhandler(404)
-def not_found(error):
+def not_found(_error):
     return jsonify({"error": "Endpoint no encontrado"}), 404
 
 
-@app.errorhandler(500)
-def internal_error(error):
-    logger.error(f"Internal error: {str(error)}")
-    return jsonify({"error": "Error interno del servidor"}), 500
-
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    debug = os.getenv("ENVIRONMENT", "development") == "development"
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")),
+            debug=os.getenv("ENVIRONMENT", "development").lower() == "development")
