@@ -108,6 +108,9 @@ def health():
 
 @app.get("/api/debug/runtime")
 def debug_runtime():
+    player_client = request.args.get("player_client", "")
+    allowed_player_clients = {"web_embedded", "android_vr", "web_safari", "mweb"}
+
     try:
         from importlib.metadata import PackageNotFoundError, version
 
@@ -133,13 +136,29 @@ def debug_runtime():
         except (OSError, subprocess.SubprocessError):
             pass
 
-    return jsonify({
+    response = {
         "yt_dlp_version": yt_dlp.version.__version__,
         "yt_dlp_ejs_version": yt_dlp_ejs_version,
         "deno_version": deno_version,
         "deno_path": deno_path,
         "python_version": platform.python_version(),
-    })
+    }
+
+    response["player_client"] = player_client
+    if player_client not in allowed_player_clients:
+        response.update({"success": False, "error": "player_client no permitido"})
+        return jsonify(response), 400
+
+    try:
+        info = yt_dlp.YoutubeDL(youtube_options(
+            extractor_args={"youtube": {"player_client": [player_client]}}
+        )).extract_info("https://www.youtube.com/watch?v=dQw4w9WgXcQ", download=False)
+        response.update({"success": info is not None, "error": None if info else "Sin respuesta del reproductor"})
+    except Exception as exc:
+        error = re.sub(r"https?://\S+", "[URL]", " ".join(str(exc).split()))
+        response.update({"success": False, "error": error[:300]})
+
+    return jsonify(response)
 
 
 @app.post("/api/validate")
